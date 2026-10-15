@@ -21,6 +21,7 @@ ROOT = "/redfish/v1"
 MAX_MESSAGE_LEN = 500
 LOGSVC_CACHE_TTL = 300.0
 MAX_REDIRECTS = 5
+MAX_PROTOCOL_RETRIES = 1
 
 SEVERITY_RANK = {
     "ok": 0,
@@ -84,16 +85,32 @@ class Redfish:
     async def _get(self, path: str) -> dict:
         path = self._local_path(path)
         redirects = 0
+        protocol_retries = 0
         while True:
             async with _semaphore(self.host):
                 try:
                     r = await self.http.get(path)
+                except httpx.RemoteProtocolError as e:
+                    if protocol_retries < MAX_PROTOCOL_RETRIES:
+                        protocol_retries += 1
+                        continue
+                    raise RedfishError(
+                        f"{self.host.name}: protocol error fetching {path} "
+                        f"({type(e).__name__})"
+                    )
                 except httpx.TimeoutException:
-                    raise RedfishError(f"{self.host.name}: timeout talking to BMC")
+                    raise RedfishError(
+                        f"{self.host.name}: timeout fetching {path}"
+                    )
                 except httpx.HTTPError as e:
                     raise RedfishError(
-                        f"{self.host.name}: connection error ({type(e).__name__})"
+                        f"{self.host.name}: connection error fetching {path} "
+                        f"({type(e).__name__})"
                     )
+
+            # A successful HTTP exchange resets the one-shot protocol retry for
+            # the next redirected resource, if any.
+            protocol_retries = 0
 
             if r.status_code in (301, 302, 303, 307, 308):
                 location = r.headers.get("location")
@@ -249,12 +266,24 @@ def _normalize(e: dict, svc: dict) -> dict:
 
 @asynccontextmanager
 async def open_session(host: BmcHost):
+    # Some iLO 5 firmware closes HTTP/1.1 keep-alive sockets without a clean
+    # response. Avoid connection reuse for BMC requests; these controllers are
+    # low-throughput management endpoints, so reliability matters more than
+    # connection setup overhead.
     async with httpx.AsyncClient(
         base_url=f"https://{host.address}:{host.port}",
         auth=(host.username, host.password),
         verify=host.verify_tls,
         timeout=host.timeout,
-        headers={"Accept": "application/json", "OData-Version": "4.0"},
+        headers={
+            "Accept": "application/json",
+            "OData-Version": "4.0",
+            "Connection": "close",
+        },
+        limits=httpx.Limits(
+            max_keepalive_connections=0,
+            max_connections=host.max_concurrency,
+        ),
         follow_redirects=False,
     ) as http:
         yield Redfish(http, host)
