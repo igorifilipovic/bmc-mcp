@@ -1,8 +1,8 @@
 """Minimal READ-ONLY Redfish client.
 
 Only HTTP GET is ever issued; there is deliberately no method for POST/PATCH/DELETE.
-Discovery is generic (walks /redfish/v1/{Systems,Managers,Chassis}/*/LogServices), so the
-same code works for iDRAC, iRMC, iLO and Oracle iLOM without vendor-specific paths.
+Discovery is generic (walks /redfish/v1/{Systems,Managers,Chassis}/*/LogServices), with
+small compatibility shims for vendor-specific Redfish behaviour such as HPE iLO 5.
 """
 from __future__ import annotations
 
@@ -20,11 +20,25 @@ from .config import BmcHost
 ROOT = "/redfish/v1"
 MAX_MESSAGE_LEN = 500
 LOGSVC_CACHE_TTL = 300.0
+MAX_REDIRECTS = 5
+MAX_PROTOCOL_RETRIES = 1
 
-SEVERITY_RANK = {"ok": 0, "informational": 0, "info": 0, "warning": 1, "critical": 2}
+SEVERITY_RANK = {
+    "ok": 0,
+    "informational": 0,
+    "info": 0,
+    "repaired": 0,
+    "warning": 1,
+    "caution": 1,
+    "critical": 2,
+}
 
 
 class RedfishError(Exception):
+    pass
+
+
+class RedfishNotFound(RedfishError):
     pass
 
 
@@ -47,9 +61,10 @@ _LOGSVC_CACHE: dict[str, tuple[float, list[dict]]] = {}
 
 
 def _semaphore(host: BmcHost) -> asyncio.Semaphore:
-    sem = _SEMAPHORES.get(host.name)
+    key = f"{host.address}:{host.port}"
+    sem = _SEMAPHORES.get(key)
     if sem is None:
-        sem = _SEMAPHORES[host.name] = asyncio.Semaphore(host.max_concurrency)
+        sem = _SEMAPHORES[key] = asyncio.Semaphore(host.max_concurrency)
     return sem
 
 
@@ -69,32 +84,74 @@ class Redfish:
 
     async def _get(self, path: str) -> dict:
         path = self._local_path(path)
-        async with _semaphore(self.host):
-            try:
-                r = await self.http.get(path)
-            except httpx.TimeoutException:
-                raise RedfishError(f"{self.host.name}: timeout talking to BMC")
-            except httpx.HTTPError as e:
-                raise RedfishError(f"{self.host.name}: connection error ({type(e).__name__})")
-        if r.status_code in (401, 403):
-            raise RedfishError(
-                f"{self.host.name}: authentication failed (HTTP {r.status_code}), check the BMC account"
-            )
-        if r.status_code == 404:
-            raise RedfishError(f"{self.host.name}: resource not found: {path}")
-        if r.status_code >= 400:
-            raise RedfishError(f"{self.host.name}: HTTP {r.status_code} for {path}")
-        try:
-            return r.json()
-        except ValueError:
-            raise RedfishError(f"{self.host.name}: invalid JSON from {path}")
+        redirects = 0
+        protocol_retries = 0
+        while True:
+            async with _semaphore(self.host):
+                try:
+                    r = await self.http.get(path)
+                except httpx.RemoteProtocolError as e:
+                    if protocol_retries < MAX_PROTOCOL_RETRIES:
+                        protocol_retries += 1
+                        continue
+                    raise RedfishError(
+                        f"{self.host.name}: protocol error fetching {path} "
+                        f"({type(e).__name__})"
+                    )
+                except httpx.TimeoutException:
+                    raise RedfishError(
+                        f"{self.host.name}: timeout fetching {path}"
+                    )
+                except httpx.HTTPError as e:
+                    raise RedfishError(
+                        f"{self.host.name}: connection error fetching {path} "
+                        f"({type(e).__name__})"
+                    )
 
-    async def _members(self, collection_path: str) -> list[str]:
+            # A successful HTTP exchange resets the one-shot protocol retry for
+            # the next redirected resource, if any.
+            protocol_retries = 0
+
+            if r.status_code in (301, 302, 303, 307, 308):
+                location = r.headers.get("location")
+                if not location:
+                    raise RedfishError(
+                        f"{self.host.name}: HTTP {r.status_code} without Location for {path}"
+                    )
+                redirects += 1
+                if redirects > MAX_REDIRECTS:
+                    raise RedfishError(
+                        f"{self.host.name}: too many redirects while fetching {path}"
+                    )
+                path = self._local_path(location)
+                continue
+
+            if r.status_code in (401, 403):
+                raise RedfishError(
+                    f"{self.host.name}: authentication failed (HTTP {r.status_code}), "
+                    "check the BMC account"
+                )
+            if r.status_code == 404:
+                raise RedfishNotFound(f"{self.host.name}: resource not found: {path}")
+            if r.status_code >= 400:
+                raise RedfishError(f"{self.host.name}: HTTP {r.status_code} for {path}")
+            try:
+                return r.json()
+            except ValueError:
+                raise RedfishError(f"{self.host.name}: invalid JSON from {path}")
+
+    async def _members(self, collection_path: str, *, missing_ok: bool = False) -> list[str]:
         try:
             doc = await self._get(collection_path)
-        except RedfishError:
-            return []
-        return [m["@odata.id"] for m in doc.get("Members", []) if "@odata.id" in m]
+        except RedfishNotFound:
+            if missing_ok:
+                return []
+            raise
+        return [
+            m["@odata.id"]
+            for m in doc.get("Members", [])
+            if isinstance(m, dict) and "@odata.id" in m
+        ]
 
     # -- systems ---------------------------------------------------------------
     async def systems(self) -> list[dict]:
@@ -102,46 +159,51 @@ class Redfish:
         for path in await self._members(f"{ROOT}/Systems"):
             d = await self._get(path)
             status = d.get("Status") or {}
-            out.append({
-                "id": d.get("Id"),
-                "name": d.get("Name"),
-                "manufacturer": d.get("Manufacturer"),
-                "model": d.get("Model"),
-                "serial_number": d.get("SerialNumber"),
-                "bios_version": d.get("BiosVersion"),
-                "power_state": d.get("PowerState"),
-                "state": status.get("State"),
-                "health": status.get("Health"),
-                "health_rollup": status.get("HealthRollup"),
-            })
+            out.append(
+                {
+                    "id": d.get("Id"),
+                    "name": d.get("Name"),
+                    "manufacturer": d.get("Manufacturer"),
+                    "model": d.get("Model"),
+                    "serial_number": d.get("SerialNumber"),
+                    "bios_version": d.get("BiosVersion"),
+                    "power_state": d.get("PowerState"),
+                    "state": status.get("State"),
+                    "health": status.get("Health"),
+                    "health_rollup": status.get("HealthRollup"),
+                }
+            )
         if not out:
             raise RedfishError(f"{self.host.name}: no systems found under {ROOT}/Systems")
         return out
 
     # -- logs ------------------------------------------------------------------
     async def log_services(self) -> list[dict]:
-        cached = _LOGSVC_CACHE.get(self.host.name)
+        cache_key = f"{self.host.address}:{self.host.port}"
+        cached = _LOGSVC_CACHE.get(cache_key)
         if cached and time.monotonic() - cached[0] < LOGSVC_CACHE_TTL:
             return cached[1]
 
         services: dict[str, dict] = {}
         for base in ("Systems", "Managers", "Chassis"):
-            for member in await self._members(f"{ROOT}/{base}"):
+            for member in await self._members(f"{ROOT}/{base}", missing_ok=True):
                 try:
                     doc = await self._get(member)
-                except RedfishError:
+                except RedfishNotFound:
                     continue
                 link = (doc.get("LogServices") or {}).get("@odata.id")
                 if not link:
                     continue
-                for svc_path in await self._members(link):
+                for svc_path in await self._members(link, missing_ok=True):
                     if svc_path in services:
                         continue
                     try:
                         svc = await self._get(svc_path)
-                    except RedfishError:
+                    except RedfishNotFound:
                         continue
-                    entries = (svc.get("Entries") or {}).get("@odata.id") or f"{svc_path.rstrip('/')}/Entries"
+                    entries = (svc.get("Entries") or {}).get("@odata.id") or (
+                        f"{svc_path.rstrip('/')}/Entries"
+                    )
                     services[svc_path] = {
                         "id": svc.get("Id") or svc_path.rstrip("/").split("/")[-1],
                         "name": svc.get("Name"),
@@ -149,8 +211,9 @@ class Redfish:
                         "path": svc_path,
                         "entries_path": entries,
                     }
+
         result = list(services.values())
-        _LOGSVC_CACHE[self.host.name] = (time.monotonic(), result)
+        _LOGSVC_CACHE[cache_key] = (time.monotonic(), result)
         return result
 
     async def entries(self, svc: dict, max_pages: int) -> tuple[list[dict], bool]:
@@ -169,29 +232,58 @@ class Redfish:
         return [_normalize(e, svc) for e in raw], truncated
 
 
+def _hpe_oem(e: dict) -> dict:
+    oem = e.get("Oem")
+    if not isinstance(oem, dict):
+        return {}
+    hpe = oem.get("Hpe")
+    return hpe if isinstance(hpe, dict) else {}
+
+
 def _normalize(e: dict, svc: dict) -> dict:
+    hpe = _hpe_oem(e)
     message = e.get("Message") or e.get("Name") or ""
+    severity = e.get("Severity") or hpe.get("Severity")
     return {
         "log": svc["id"],
         "scope": svc["scope"],
         "id": e.get("Id"),
         "created": e.get("Created") or e.get("EventTimestamp"),
-        "severity": e.get("Severity"),
+        "severity": severity,
         "message": str(message)[:MAX_MESSAGE_LEN],
         "message_id": e.get("MessageId"),
         "entry_type": e.get("EntryType"),
         "sensor_type": e.get("SensorType"),
+        "oem_record_format": e.get("OemRecordFormat"),
+        "hpe_severity": hpe.get("Severity"),
+        "recommended_action": hpe.get("RecommendedAction"),
+        "categories": hpe.get("Categories"),
+        "repaired": hpe.get("Repaired"),
+        "count": hpe.get("Count"),
+        "learn_more": hpe.get("LearnMoreLink"),
     }
 
 
 @asynccontextmanager
 async def open_session(host: BmcHost):
+    # Some iLO 5 firmware closes HTTP/1.1 keep-alive sockets without a clean
+    # response. Avoid connection reuse for BMC requests; these controllers are
+    # low-throughput management endpoints, so reliability matters more than
+    # connection setup overhead.
     async with httpx.AsyncClient(
         base_url=f"https://{host.address}:{host.port}",
         auth=(host.username, host.password),
         verify=host.verify_tls,
         timeout=host.timeout,
-        headers={"Accept": "application/json", "OData-Version": "4.0"},
+        headers={
+            "Accept": "application/json",
+            "OData-Version": "4.0",
+            "Connection": "close",
+        },
+        limits=httpx.Limits(
+            max_keepalive_connections=0,
+            max_connections=host.max_concurrency,
+        ),
         follow_redirects=False,
     ) as http:
         yield Redfish(http, host)
@@ -211,11 +303,14 @@ async def get_events(
         if log_service:
             q = log_service.lower()
             services = [
-                s for s in services
+                s
+                for s in services
                 if q in s["id"].lower() or q in (s["name"] or "").lower()
             ]
             if not services:
-                raise RedfishError(f"{host.name}: no log service matching '{log_service}'")
+                raise RedfishError(
+                    f"{host.name}: no log service matching '{log_service}'"
+                )
 
         results = await asyncio.gather(
             *(rf.entries(s, max_pages) for s in services), return_exceptions=True
@@ -223,7 +318,9 @@ async def get_events(
 
     min_rank = severity_rank(min_severity)
     cutoff = (
-        datetime.now(timezone.utc) - timedelta(hours=since_hours) if since_hours else None
+        datetime.now(timezone.utc) - timedelta(hours=since_hours)
+        if since_hours is not None
+        else None
     )
     events: list[dict] = []
     errors: list[str] = []
