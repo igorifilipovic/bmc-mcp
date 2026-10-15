@@ -1,0 +1,26 @@
+# Copy to hosts.yaml. Credentials are taken from environment variables (see .env).
+servers:
+  - name: dell-01
+    vendor: idrac          # idrac | irmc | ilo | ilom | generic  (informational label)
+    address: 10.0.0.11
+    username_env: DELL01_USER
+    password_env: DELL01_PASSWORD
+    verify_tls: false      # BMCs usually have self-signed certs
+
+  - name: hpe-01
+    vendor: ilo
+    address: 10.0.0.12
+    username_env: ILO01_USER
+    password_env: ILO01_PASSWORD
+
+  # - name: fujitsu-01
+  #   vendor: irmc
+  #   address: 10.0.0.13
+  #   username_env: IRMC01_USER
+  #   password_env: IRMC01_PASSWORD
+  #
+  # - name: oracle-01
+  #   vendor: ilom
+  #   address: 10.0.0.14
+  #   username_env: ILOM01_USER
+  #   password_env: ILOM01_PASSWORD

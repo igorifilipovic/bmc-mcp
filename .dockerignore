@@ -1,0 +1,6 @@
+.env
+certs
+config/hosts.yaml
+tests
+**/__pycache__
+.venv

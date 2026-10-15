@@ -1,0 +1,21 @@
+services:
+  bmc-mcp:
+    build: .
+    image: bmc-mcp:latest
+    container_name: bmc-mcp
+    restart: unless-stopped
+    ports:
+      - "8001:8001"
+    env_file:
+      - .env
+    environment:
+      MCP_HOSTS_FILE: /app/config/hosts.yaml
+      MCP_TLS_CERT: /certs/server.crt
+      MCP_TLS_KEY: /certs/server.key
+    volumes:
+      - ./config/hosts.yaml:/app/config/hosts.yaml:ro
+      - ./certs:/certs:ro
+    read_only: true
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
