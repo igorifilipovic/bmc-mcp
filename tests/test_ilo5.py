@@ -89,6 +89,35 @@ class Ilo5CompatibilityTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
 
+    async def test_remote_protocol_error_is_retried_once(self):
+        calls = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise httpx.RemoteProtocolError(
+                    "Server disconnected without sending a response.",
+                    request=request,
+                )
+            return httpx.Response(
+                200,
+                json={"Members": [{"@odata.id": "/redfish/v1/Systems/1"}]},
+                request=request,
+            )
+
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(
+            base_url="https://ilo5.example.test",
+            transport=transport,
+            follow_redirects=False,
+        ) as client:
+            rf = Redfish(client, self.host)
+            members = await rf._members("/redfish/v1/Systems")
+
+        self.assertEqual(members, ["/redfish/v1/Systems/1"])
+        self.assertEqual(calls, 2)
+
 
 if __name__ == "__main__":
     unittest.main()
